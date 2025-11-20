@@ -1,0 +1,665 @@
+---
+title: "Home Credit Default Risk Modeling"
+author: "Joel Jorgensen"
+date: today
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+
+---
+# Introduction
+Home Credit is a multi national financial services provider offering a variety of loan products, they aim to make borrowing more accessible by offering loans to those customers who are typically under served,the under or unbanked.
+
+A big challenge that arises from this is that  some customers lack a traditional credit score, this makes it more difficult to determine credit worthiness and decide who to extend loans to.
+
+The goal of this project is to build a predictive model on which customers will default or face repayment problems, and to maximize the accuracy by using the data available at the time of their application and supplementing when possible from a few additional available data sources
+
+
+
+# Load Data and Setup
+
+```{r library}
+pacman::p_load(tidyverse, caret, janitor, skimr, recipes, themis, rlang, tidymodels, here,caretEnsemble)
+```
+
+Data is all loaded in. This is 5 total data sets. The main set is the application data, then there are four additional data sets to supplement and try and improve the model accuracy. 
+```{r load data application train}
+
+dir<- getwd()
+setwd(dir)
+
+#load file - assumes you have copy of file in working directory
+hc_train <-read.csv("application_train.csv", stringsAsFactors = TRUE)
+application_train <- read.csv("application_train.csv")
+
+#standardize variable names
+hc_train <- hc_train |>
+  rename_with(tolower)
+
+#convert target and select numeric indicators to factors
+hc_train <- hc_train |>
+  mutate(
+    target = as.factor(target),
+    across(starts_with("flag"),as.factor),
+    across(starts_with("reg_"),as.factor),
+    across(starts_with("live_"),as.factor)
+    )
+```
+
+```{r load data bureau}
+#load file - assumes you have copy of file in working directory
+bureau_data <- read.csv("bureau.csv", stringsAsFactors = TRUE)
+
+#standardize variable names
+bureau_data <- bureau_data |>
+  rename_with(tolower)
+
+```
+
+```{r load data installment}
+#load file - assumes you have copy of file in working directory
+installment_data <- read.csv("installments_payments.csv", stringsAsFactors = TRUE)
+
+#standardize variable names
+installment_data <- installment_data |>
+  rename_with(tolower)
+
+```
+
+```{r load credit card data}
+#load file - assumes you have copy of file in working directory
+credit_card_data <- read.csv("credit_card_balance.csv", stringsAsFactors = TRUE)
+
+#filter to only include selected columns
+credit_card_data <- credit_card_data |>
+  select(
+    SK_ID_CURR,
+    MONTHS_BALANCE,
+    AMT_BALANCE,
+    AMT_CREDIT_LIMIT_ACTUAL,
+    AMT_INST_MIN_REGULARITY,
+    AMT_PAYMENT_CURRENT,
+    AMT_PAYMENT_TOTAL_CURRENT,
+    SK_DPD
+  )
+```
+
+```{r load pos bal data}
+#load file - assumes you have copy of file in working directory
+pos_cash_data <-read.csv("POS_CASH_balance.csv", stringsAsFactors = TRUE)
+
+#filter to only include selected columns
+pos_cash_data <- pos_cash_data |>
+  select(SK_ID_CURR,
+         MONTHS_BALANCE,
+         CNT_INSTALMENT,
+         CNT_INSTALMENT_FUTURE,
+         SK_DPD
+  )
+```
+
+
+#EDA
+
+## Target Variable
+First we look at the target variable we can see customers have repayment difficulties about 8% of the time, if we were to predict in all cases that customers wouldn't have a repayment issue we would be correct 92% of the time. This indicates a noticeable class in balance. 
+```{r class balance}
+round(mean(application_train$TARGET) * 100,2)
+```
+
+## Further Feature Exploration
+
+Next we will look at the categorical variables in comparison to the target variable. 
+```{r}
+application_train_clean <- application_train
+#get target and char columns
+application_train_clean |> select_if(is.character) -> char_df
+char_df <- char_df |> mutate(TARGET = application_train_clean$TARGET)
+```
+
+For NAME_CONTRACT_TYPE we see a higher proportion of payment issues with Cash compared to Resolving loans.  
+```{r name_contract_type}
+
+char_df |> ggplot(aes(x = NAME_CONTRACT_TYPE, fill = factor(TARGET))) + 
+  geom_bar(position = "fill") + labs(title = "Proportion of Target by Contract Type",
+    y = "Proportion",
+    x = "Contract Type",
+    fill = "Target Variable")
+  scale_y_continuous(labels = scales::percent)
+```
+For applicants who own cars and real estate they have a slightly lower proportion of repayment difficulty, the relative proportions look quite similar between the two features. 
+```{r own car}
+
+char_df |> ggplot(aes(x = FLAG_OWN_CAR, fill = factor(TARGET))) + 
+  geom_bar(position = "fill") + labs(title = "Proportion of Target by Own CAR",
+    y = "Proportion",
+    x = "Contract Type",
+    fill = "Target Variable")
+  scale_y_continuous(labels = scales::percent)
+```
+
+
+If we look at NAME Income TYPE, we see that those on maternity leave and unemployed have much higher proportions of payment difficulties. For these two cases this would be a very strong predictor. 
+```{r income type}
+char_df |> ggplot(aes(x = NAME_INCOME_TYPE, fill = factor(TARGET))) + 
+  geom_bar(position = "fill") + theme(axis.text.x = element_text(angle = 45)) + labs(title = "Proportion of Target Name Income Type",
+    y = "Proportion",
+    x = "Contract Type",
+    fill = "Target Variable")
+  scale_y_continuous(labels = scales::percent) 
+```
+
+
+We see a slightly higher of payment problems proportionally with those who rent apartments or live with their parents. 
+```{r housing type}
+char_df |> ggplot(aes(x = NAME_HOUSING_TYPE, fill = factor(TARGET))) + 
+  geom_bar(position = "fill") + theme(axis.text.x = element_text(angle = 45)) + labs(title = "Proportion of Target Name Housing Type",
+    y = "Proportion",
+    x = "Contract Type",
+    fill = "Target Variable")
+  scale_y_continuous(labels = scales::percent) 
+```
+
+We do see some variation based on different occupation types, with occupations like drivers and low skilled laborers having the high proportion of payment difficulties. This could be explained largely by these occupations having the lowest pay. 
+```{r occupation type}
+char_df |> ggplot(aes(x = OCCUPATION_TYPE, fill = factor(TARGET))) + 
+  geom_bar(position = "fill") + theme(axis.text.x = element_text(angle = 45)) + labs(title = "Proportion of Target Name Housing Type",
+    y = "Proportion",
+    x = "Contract Type",
+    fill = "Target Variable")
+  scale_y_continuous(labels = scales::percent) 
+```
+If we look at average pay by occupation, we can see the lowest paying jobs on average tend to have higher proportions of repayment difficulties in the chart above. This will be worth keeping in mind when building a model as these items are closely related.
+```{r pay by occupation}
+#average pay by occupation
+application_train_clean |> group_by(OCCUPATION_TYPE) |> summarise(avg_inc = mean(AMT_INCOME_TOTAL)) |> arrange(avg_inc)
+```
+
+
+# Additional Data Source Preperation
+Calculated columns are created for the additional data sources. Then for each an aggregation is performed to try and capture any relevant signal while getting it so their is one row for each client. 
+
+## Bureau Data
+```{r created aggregated bureau data}
+#creates new data frame of aggregated bureau data
+bureau_agg <- bureau_data |>
+    group_by(sk_id_curr) |>
+    summarise(
+      bur_n_loans = n(),
+      #status counts
+      bur_n_active       = sum(credit_active == "Active", na.rm = TRUE),
+      bur_n_closed       = sum(credit_active == "Closed", na.rm = TRUE),
+      #min/max days since credit application
+      bur_min_days_credit = suppressWarnings(min(days_credit, na.rm = TRUE)),
+      bur_max_days_credit = suppressWarnings(max(days_credit, na.rm = TRUE)),
+      #amount aggregates
+      bur_sum_credit_sum     = sum(amt_credit_sum, na.rm = TRUE),
+      bur_sum_credit_debt    = sum(amt_credit_sum_debt, na.rm = TRUE),
+      bur_sum_credit_overdue = sum(amt_credit_sum_overdue, na.rm = TRUE),
+      bur_sum_credit_limit   = sum(amt_credit_sum_limit, na.rm = TRUE),
+      #max overdue
+      bur_max_amt_credit_max_overdue = suppressWarnings(max(amt_credit_max_overdue, na.rm = TRUE)),
+      #credit type counts
+      bur_n_mortgage         = sum(credit_type == "Mortgage", na.rm = TRUE),
+      bur_n_auto             = sum(credit_type == "Car loan", na.rm = TRUE),
+      bur_n_consumer_credit  = sum(credit_type == "Consumer credit", na.rm = TRUE),
+      bur_n_credit_card      = sum(credit_type == "Credit card", na.rm = TRUE),
+      .groups = "drop"
+    )
+#removes infinity values created from min/max functions and changes to 0, INF and - INF occur if min/max is ran on NA values
+bureau_agg <- bureau_agg |> mutate(across(where(is.numeric), ~ ifelse(is.infinite(.x), NA_real_, .x)))
+#replace any remaining NA from aggregation with 0
+bureau_agg <- bureau_agg |>
+  mutate(across(where(is.numeric), ~ replace_na(.x, 0)))
+
+# check for any remaining NAs - none
+#bureau_agg |>
+  #filter(if_any(everything(), is.na))
+```
+
+## Installment Data
+
+```{r installment data}
+#take differences prior to aggregation
+installment_data <- installment_data |> 
+  mutate(day_dif = days_instalment - days_entry_payment # difference between loan is due and when it was paid
+        ,amt_dif = amt_instalment - amt_payment # difference between amount of payment due and what was paid
+  )
+
+# 2905 rows have NAs, which shows they haven't actually made that payment
+colSums(is.na(installment_data[, c("day_dif", "amt_dif")]))
+summary(installment_data[, c("day_dif", "amt_dif")])
+
+# view head of data
+installment_data |>
+  filter(is.na(day_dif) | is.na(amt_dif)) |> head(10)
+
+
+# remove instalment amounts = to 0
+installment_data <- installment_data |>
+  filter(amt_instalment != 0)
+
+```
+
+```{r installment data continued}
+#below creates calculated fields before aggregation is performed
+
+# set day dif to how long hasn't been paid if no payment
+installment_data <- installment_data |> mutate(day_dif = ifelse(is.na(day_dif),days_instalment,day_dif))
+# set amt dif to how much is unpaid if no payment
+installment_data <- installment_data |> mutate(amt_dif = ifelse(is.na(amt_dif),amt_instalment,amt_dif))
+# get ratio of payment difference compared to payment due, flag if paid on time, flag if payment missed
+installment_data <- installment_data |> mutate(paid_ratio = amt_dif / amt_instalment,
+                                               paid_late = ifelse(day_dif <= 0, 1,0),
+                                               missed_payment = ifelse(paid_ratio == 1, 1, 0))
+#filter to only have needed columns
+installment_data <- installment_data |> select(sk_id_curr, day_dif, amt_dif, paid_ratio, paid_late, missed_payment)
+# positive day dif is early payment, 0 is ontime, negative is late
+```
+
+```{r installment data aggregation}
+#aggregate installment data
+installment_agg <- installment_data |>
+  group_by(sk_id_curr) |>
+  summarise(
+    in_n_installments = n(),
+    in_avg_day_dif = mean(day_dif, na.rm = TRUE),
+    in_min_day_dif = min(day_dif, na.rm = TRUE),
+    in_max_day_dif = max(day_dif, na.rm = TRUE),
+    in_avg_amt_dif = mean(amt_dif, na.rm = TRUE),
+    in_total_amt_dif = sum(amt_dif, na.rm = TRUE),
+    in_avg_paid_ratio = mean(paid_ratio, na.rm = TRUE),
+    in_share_paid_late = mean(paid_late, na.rm = TRUE),
+    in_share_missed_pmt = mean(missed_payment, na.rm = TRUE),
+    in_n_paid_late = sum(paid_late, na.rm = TRUE),
+    in_n_missed_pmt = sum(missed_payment, na.rm = TRUE),
+    .groups = "drop"
+  )
+#removes infinity values
+installment_agg <- installment_agg |> mutate(across(where(is.numeric), ~ ifelse(is.infinite(.x), NA_real_, .x)))
+#replace any remaining NA from aggregation with 0
+installment_agg <- installment_agg |>
+  mutate(across(where(is.numeric), ~ replace_na(.x, 0)))
+
+```
+
+## Credit Card Data
+
+```{r credit card data}
+#cleanup NAs
+credit_card_data <- credit_card_data |> 
+  mutate(AMT_PAYMENT_CURRENT = ifelse(is.na(AMT_PAYMENT_CURRENT),0,AMT_PAYMENT_CURRENT),
+         AMT_INST_MIN_REGULARITY =ifelse(is.na(AMT_INST_MIN_REGULARITY),0,AMT_INST_MIN_REGULARITY))
+
+# safe_division funciton to avoid Inf/Na when denominator is 0 or NA
+safe_div <- function(num, den) ifelse(is.na(den) | den <= 0, 0, num / den)
+
+#create additional columns
+credit_card_data <- credit_card_data |>
+  mutate(
+    util = safe_div(AMT_BALANCE, AMT_CREDIT_LIMIT_ACTUAL),
+    pay_vs_min = safe_div(AMT_PAYMENT_CURRENT, AMT_INST_MIN_REGULARITY),
+    pay_to_balance = safe_div(AMT_PAYMENT_TOTAL_CURRENT, AMT_BALANCE), 
+    is_delinquent = SK_DPD > 0,                                           
+    paid_min = AMT_INST_MIN_REGULARITY > 0 & AMT_PAYMENT_CURRENT >= AMT_INST_MIN_REGULARITY,
+    paid_full = AMT_BALANCE > 0 & AMT_PAYMENT_TOTAL_CURRENT >= AMT_BALANCE,      
+  )
+# check for any NAs
+#credit_card_data |>
+  #filter(if_any(everything(), is.na))
+```
+
+```{r credit card aggregation}
+# aggregated data set
+credit_card_agg <- credit_card_data |>
+  group_by(SK_ID_CURR) |>
+  summarise(
+    # time covered
+    cc_n_months            = n(),
+    cc_last_month          = max(MONTHS_BALANCE, na.rm = TRUE),
+    cc_span_months         = max(MONTHS_BALANCE, na.rm = TRUE) - 
+                          min(MONTHS_BALANCE, na.rm = TRUE),
+    # balances, limits, utilization
+    cc_avg_balance         = mean(AMT_BALANCE, na.rm = TRUE),
+    cc_max_balance         = max(AMT_BALANCE, na.rm = TRUE),
+    cc_avg_limit           = mean(AMT_CREDIT_LIMIT_ACTUAL, na.rm = TRUE),
+    cc_util_mean           = mean(util, na.rm = TRUE),
+    cc_util_max            = max(util, na.rm = TRUE),
+    # payments vs due
+    cc_pay_vs_min_mean     = mean(pay_vs_min, na.rm = TRUE),
+    cc_pay_to_balance_mean = mean(pay_to_balance, na.rm = TRUE),
+    # delinquency/behavior
+    cc_any_dpd             = any(is_delinquent, na.rm = TRUE),
+    cc_share_dpd           = mean(is_delinquent, na.rm = TRUE),
+    cc_max_dpd             = max(SK_DPD, na.rm = TRUE),
+    cc_share_paid_min      = mean(paid_min, na.rm = TRUE),
+    cc_share_paid_full     = mean(paid_full, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    across(where(is.numeric), ~ ifelse(is.infinite(.x), NA_real_, .x))
+  )
+#forgot to turn to lowercase initially so tidy up
+credit_card_agg <- credit_card_agg |>
+  rename_with(tolower)
+#check for any NA
+#credit_card_agg |>
+  #filter(if_any(everything(), is.na))
+```
+## POS Cash Balance
+
+```{r pos cash data}
+#cleanup NAs
+pos_cash_data <- pos_cash_data |> mutate(CNT_INSTALMENT = ifelse(is.na(CNT_INSTALMENT),0,CNT_INSTALMENT),
+                CNT_INSTALMENT_FUTURE = ifelse(is.na(CNT_INSTALMENT_FUTURE),0,CNT_INSTALMENT_FUTURE)
+)
+
+# create additional columns
+pos_cash_data <- pos_cash_data |>
+  mutate(
+    # paid and remaining ratios for installments
+    share_paid = safe_div(CNT_INSTALMENT - CNT_INSTALMENT_FUTURE, CNT_INSTALMENT),
+    share_remaining = safe_div(CNT_INSTALMENT_FUTURE, CNT_INSTALMENT),
+    # deliquencies 
+    is_dpd = SK_DPD > 0
+  )
+
+
+
+```
+
+
+```{r pos cash data agg}
+#create aggregation
+pos_cash_agg <- pos_cash_data |>
+  group_by(SK_ID_CURR) |>
+  summarise(
+    # duration of months
+    pos_n_months        = n(),
+    pos_last_month      = max(MONTHS_BALANCE, na.rm = TRUE),
+    pos_span_months     = pos_last_month - min(MONTHS_BALANCE, na.rm = TRUE),
+    # term and future ratios
+    pos_term_median     = median(CNT_INSTALMENT, na.rm = TRUE),
+    pos_term_max        = max(CNT_INSTALMENT, na.rm = TRUE),
+    pos_future_median   = median(CNT_INSTALMENT_FUTURE, na.rm = TRUE),
+    pos_future_min      = min(CNT_INSTALMENT_FUTURE, na.rm = TRUE),
+    # repayment progress ratios
+    pos_share_paid_mean = mean(share_paid, na.rm = TRUE),
+    pos_share_rem_mean  = mean(share_remaining, na.rm = TRUE),
+    # delinquency
+    pos_any_dpd         = any(is_dpd, na.rm = TRUE),
+    pos_share_dpd       = mean(is_dpd, na.rm = TRUE),
+    pos_max_dpd         = max(SK_DPD, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  # replace inf
+  mutate(across(where(is.numeric), ~ ifelse(is.infinite(.x), NA_real_, .x)))
+
+#check for any NA
+#pos_cash_agg |>
+  #filter(if_any(everything(), is.na))
+#forgot to turn to lowercase initially so tidy up
+pos_cash_agg <- pos_cash_agg |>
+  rename_with(tolower)
+
+```
+
+
+
+
+# Application Data Preperation
+
+
+## Feature Selection Missing Data and NAs
+Variables where greater than 50% of values were missing were dropped. The one exception was ext_source_1. A good portion of those dropped were related to those living in apartments and the characteristics of their housing. 
+
+83 feature variables are retained. 
+```{r drop missing data application}
+# % missing per variable (full dataset)
+missing_perc <- colMeans(is.na(hc_train))
+
+# Keep rule: ≤ 50% missing
+cols_to_keep <- names(missing_perc[missing_perc <= 0.50])
+
+# Exception: always keep EXT_SOURCE_1
+cols_final <- unique(c(cols_to_keep, "ext_source_1"))
+
+# Filter dataset
+hc_train <- hc_train |>
+  dplyr::select(all_of(cols_final))
+
+```
+
+## Outliers
+One outlier value has been identified and that is the highest income earner listed, this value is removed. 
+Also the days employed uses an extreme value for place holding when a person is not employed, so this value is changed from 365,243 to 0. 
+
+```{r remove outliers}
+#filter to remove incomes more than 100million
+hc_train |> filter(amt_income_total <= 100000000) -> hc_train
+#mutate days employed to 0 for positive values
+hc_train |> mutate(days_employed = ifelse(days_employed > 0,0,days_employed)) -> hc_train
+```
+
+
+
+## Joining Data
+All four aggregated sets of data are left joined onto application training data set.
+```{r merge data}
+#join data
+hc_merged <- hc_train |> left_join(bureau_agg, by = "sk_id_curr")
+hc_merged <- hc_merged |> left_join(installment_agg, by = "sk_id_curr")
+hc_merged <- hc_merged |> left_join(credit_card_agg, by = "sk_id_curr")
+hc_merged <- hc_merged |> left_join(pos_cash_agg, by = "sk_id_curr")
+
+```
+
+
+# Training and Test Partions
+Splitting into a 80/20 train/test partition split. 
+
+```{r Q3}
+set.seed(61)
+#create data partition index
+index <- createDataPartition(y = hc_merged$target, p = 0.8, list = FALSE)
+#create split data frames
+train_hc_merged <- hc_merged[index,]
+holdout_hc_merged <- hc_merged[-index,] # do not use at all - only for very last run once model picked
+
+```
+
+
+## Missing Data Imputation and Log Scaling
+Imputation of missing values and NAs is done last after data is all joined and split to avoid leakage. Income is log transformed due to it's heavy right skew. Modal values are imputed for categorical, median for numeric. Finally numeric data is scaled to account for certain models being sensitive to magnitude differences of variables. 
+
+A data cleaning recipe is created that can be used on all test and training data. 
+For training data an additional recipe is used that creates oversampled data set for use.
+```{r recipe creation}
+#recipe for data cleaning - to be used on all future data sets
+rec <- recipe(target ~ ., data = train_hc_merged) |>
+  update_role(sk_id_curr, new_role = "id") |> # set so ID doesn't get touched
+  step_zv(all_predictors()) |> #remove zero variance predictors
+  step_indicate_na(all_predictors()) |> #flag variable value that was NA, possible signal
+  step_impute_median(all_numeric_predictors()) |> #impute medians on NA
+  step_impute_mode(all_nominal_predictors()) |> #impute modal for non numeric
+  step_mutate(amt_income_total = log1p(amt_income_total)) |> # log scale income - 1p for 0 vals
+  step_normalize(all_numeric_predictors(), -starts_with("na_ind_")) |> #scales all numeric - svm/logistic sensitive - doesn't scale flagged NA created values
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |> #one hot encodes all categorical
+  step_zv(all_predictors()) #remove zero variance predictors after dummys created
+
+```
+
+Oversampling techniques evaluated
+SMOTE - synthetic minority oversampling - creates synthetic nearest neighbor points (two big weaknesses of high n dimensions and categorical data) - for this reason not used
+
+Upsample - randomly oversampling with replacement, most simple and straight forward
+
+ROSE - random oversampling examples - creates synthetic data points using kernel density estimation (small item is it can create nonsensical examples, no other cons except computationally intensive and sensitive to tuning) - for this reason not used but could be revisited
+
+
+Oversample ratio is used as starting point of .5 (2 to 1 for majority vs minority). This can be tweaked as needed later
+```{r over sample recipe}
+# baseline recipe for no over sampling
+rec_base  <- rec
+#recipe for oversampling - adds oversampling at the end of data prep
+rec_over_sample <- rec |> step_upsample(target, over_ratio = 0.5, skip = FALSE)
+rec_down_sample <- rec |> step_downsample(target, under_ratio = 1, skip = FALSE)
+```
+
+
+
+```{r apply recipe to data}
+#train recipe on training data split
+prep_base <- prep(rec_base, training = train_hc_merged, verbose = FALSE)
+prep_over <- prep(rec_over_sample, training = train_hc_merged, verbose = FALSE)
+prep_down <- prep(rec_down_sample, training = train_hc_merged, verbose = FALSE)
+#create data frames
+x_train_base <- juice(prep_base)
+x_train_over_sample <- juice(prep_over)
+x_train_down_sample <- juice(prep_down)
+
+```
+
+
+# Ensemble Model
+An ensemble model is trained on the down sampled data , it uses 5 fold cross validation to determine the optimal hyper parameters. The model cross validation code is lengthy so only ran once and then saved and called in the future. 
+```{r train ensemble}
+# #rename target for model
+# x_train_down_sample2 <- x_train_down_sample |> mutate(target = factor(target, levels = c(0,1), 
+#                                                         labels = c("Class0", "Class1"))) |> tidyr::drop_na()
+# x_train_base2 <- x_train_base |> mutate(target = factor(target, levels = c(0,1), 
+#                                                         labels = c("Class0", "Class1")))
+# 
+# 
+# #create ensemble control
+# ensemble_ctrl <- trainControl(
+#   method = "cv", number = 5,
+#   classProbs = TRUE,
+#   summaryFunction = twoClassSummary,
+#   savePredictions = "final",
+#   allowParallel = TRUE)
+# 
+# #train model
+# ensemble_list <- caretList(
+#   target ~ ., data = x_train_down_sample2,
+#   trControl = ensemble_ctrl,
+#   metric = "ROC",
+#   tuneList = list(
+#     #will adjust these based on prior optimal xgboost hyper params
+#     xgbTree = caretModelSpec(
+#       method = "xgbTree",
+#       tuneGrid = expand.grid(
+#         nrounds = c(5, 10),
+#         max_depth = c(3, 5),
+#         eta = c(0.05, 0.1),
+#         gamma = 0,
+#         colsample_bytree = 0.8,
+#         min_child_weight = 1,
+#         subsample = 0.8)),
+#     #will adjust these based on prior optimal nn hyper params
+#     nnet = caretModelSpec(
+#       method = "nnet",
+#       trace = FALSE,
+#       preProcess = c("center", "scale"),
+#       tuneGrid = expand.grid(
+#         size = c(10),
+#         decay = c(1e-4, 1e-3)),
+#         MaxNWts = 100000,
+#         maxit  = 200)))
+# 
+
+```
+
+
+```{r regression ensemble}
+#train regression on model stack
+# stack_glm <- caretStack(
+#   ensemble_list,
+#   method = "glm",
+#   family = binomial(),
+#   metric = "ROC",
+#   trControl = ensemble_ctrl)
+## model only ran one time and saved below
+
+# cv performance
+#trying on downsampled
+resamples(ensemble_list) |> summary()
+
+# save ensemble models
+#saveRDS(stack_glm, file = "stack_glm_model.rds")
+#saveRDS(ensemble_list, file = "ensemble_model.rds")
+
+
+# load ensemble models
+stack_glm <- readRDS("stack_glm_model.rds")
+#ensemble_model <- readRDS("ensemble_model.rds")
+
+```
+
+The ensemble model gives an expected AUC ROC of .7417 on the cross validation data.
+```{r}
+
+#out of fold AUC - 75%
+pred_df <- stack_glm$ens_model$pred   # has obs (factor), and class-prob columns
+pos <- levels(pred_df$obs)[1]
+stopifnot(pos %in% names(pred_df))
+roc_cv  <- pROC::roc(pred_df$obs, pred_df[[pos]], quiet = TRUE)
+pROC::auc(roc_cv)
+```
+
+
+# Submission
+A final submission for Kaggle is created. This loads in the test data, creates the predictions and generates a file. 
+```{r}
+#load file - assumes you have copy of file in working directory
+hc_test <-read.csv("application_test.csv", stringsAsFactors = TRUE)
+
+#standardize variable names
+hc_test <- hc_test |>
+  rename_with(tolower)
+
+#convert target and select numeric indicators to factors
+hc_test <- hc_test |>
+  mutate(
+    across(starts_with("flag"),as.factor),
+    across(starts_with("reg_"),as.factor),
+    across(starts_with("live_"),as.factor)
+    )
+```
+
+
+
+```{r}
+#join data
+final_merged <- hc_test |> left_join(bureau_agg, by = "sk_id_curr")
+final_merged <- final_merged |> left_join(installment_agg, by = "sk_id_curr")
+final_merged <- final_merged |> left_join(credit_card_agg, by = "sk_id_curr")
+final_merged <- final_merged |> left_join(pos_cash_agg, by = "sk_id_curr")
+
+final_base <- bake(prep_base, new_data = final_merged)
+```
+
+```{r}
+id_final <- final_base$sk_id_curr
+final_base <- final_base |> select(-sk_id_curr) |> as.matrix()
+final_pred <- predict(stack_glm, final_base, type = "response")
+```
+
+```{r}
+output_df <- data.frame(
+  SK_ID_CURR = id_final,
+  TARGET = as.vector(final_pred)
+)
+
+write.csv(output_df, "submission.csv", row.names = FALSE)
+```
+
